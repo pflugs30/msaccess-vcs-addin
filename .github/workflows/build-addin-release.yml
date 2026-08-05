@@ -83,6 +83,8 @@ jobs:
             exit 1
           }
           Write-Host "Tag $tag is new. Proceeding with build."
+          # gh release view leaves LASTEXITCODE non-zero when the release is absent; reset so the step succeeds.
+          exit 0
 
       - name: Setup VBA runtime
         uses: DecimalTurn/setup-vba@abad6bed4025d3d709cbd9c9281f856d298bd68d # v0.1.2
