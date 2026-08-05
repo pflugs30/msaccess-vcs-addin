@@ -83,6 +83,25 @@ contradictory guidance.
 
 ---
 
+## 2026-08-05 — Treat a Rubberduck `@TestMethod("category")` argument as a filterable tag
+
+**Trigger**: Rubberduck lets a test declare a category via `@TestMethod("Integration")`, and its own Test Explorer groups by that category. A consuming project wanted the same category usable as a VCS filter — e.g. `VCS.RunTestsHeadless("-Integration")` to skip live integration tests in CI — without having to duplicate every category as a separate `'@Tag("integration")` annotation. Before this change the category argument was parsed only to detect the annotation's presence and was then discarded, so it matched nothing in the four-level filter.
+
+**Options explored**:
+- **Interim `'@Tag` duplication in the consuming project.** Add a redundant `'@Tag("Integration")` to each `@TestModule`. Works today with no add-in change, but the annotation is redundant with the category the module already carries, Rubberduck flags `@Tag` as an unrecognized annotation, and every project pays the tax. Kept only as a stop-gap.
+- **A dedicated category filter level** separate from tags. Rejected: categories and tags are the same concept for filtering purposes (a case-insensitive label on a test), and the existing tag matcher, exclusion syntax (`-`), and web-runner Tags UI already do exactly what's needed. A parallel mechanism would duplicate all of it.
+- **Fold the category into the tag set at discovery time (chosen).** `ExtractTestMethodCategory` reads the quoted argument from the `@TestMethod` annotation block (mirroring `ExtractIgnoreReason`), and `RegisterTest` adds it, lowercased, to the merged tag collection via a new optional `strCategoryTag` parameter. The add-through-key dedupe means pairing a category with an equal explicit `'@Tag` is harmless.
+
+**Decision**: Surface the RD category as a tag during discovery. A Rubberduck category is now selectable through every existing filter path (`VCS.RunTests`, `VCS.RunTestsHeadless`, ribbon default filter, web-runner Tags) with zero extra annotations. Only the two RD discovery call sites pass a category; the native `TestAssert` path is unchanged.
+
+**What this rules out**: Categories and tags now share one namespace — a category and a `'@Tag` with the same text collapse to one filter token, which is intended. If a future need arises to filter on "category *specifically*, not tag," this would need a separate stored field. No such need is anticipated; Rubberduck itself treats a category as a single label.
+
+> **⚠ Superseded** (2026-08-05): The interim `'@Tag` duplication guidance is obsolete for categories. A `@TestMethod("category")` argument is now a filterable tag automatically. See "Treat a Rubberduck `@TestMethod(\"category\")` argument as a filterable tag" above.
+
+**Relevant files**: `Version Control.accda.src/modules/Tests/clsTestRunner.cls` (`ExtractTestMethodCategory`, `RegisterTest`, RD discovery call sites), `docs/rubberduck-test-runner.md`, `Wiki/Rubberduck-Testing-Support.md`, `AGENTS.md`.
+
+---
+
 ## 2026-08-04 — Design View queries carry parameters in a `Begin Parameters` block, not a leading SQL `PARAMETERS` line
 
 **Trigger**: A parameterized query rebuilt from source lost its `PARAMETERS`
