@@ -1,0 +1,196 @@
+name: Build Add-in Release
+
+# Builds this repository's msaccess-vcs add-in from its own source
+# (Version Control.accda.src) and publishes a fork-unique GitHub pre-release.
+#
+# The published asset uses the SAME name/shape as the public add-in release
+# ("Version Control.accda" inside "Version Control.zip"), so downstream tooling
+# that globs "Version*.zip" and expects "Version Control.accda" works unchanged.
+# Only the release tag/name is fork-unique, so any feature branch can publish a
+# distinguishable build on demand.
+#
+# Consume from the app build by pointing VBA-Build's `vcs-url` input at this
+# release's API URL. Switch back to the public add-in by removing that input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark the GitHub release as a pre-release"
+        type: boolean
+        default: true
+      bootstrap-url:
+        description: "Public add-in release API URL used to bootstrap the build"
+        type: string
+        default: "https://api.github.com/repos/joyfullservice/msaccess-vcs-addin/releases/tags/v5.0.1"
+
+permissions:
+  contents: write # Required for creating releases and tags
+
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      # Expose the workflow token so the bootstrap install can authenticate its
+      # GitHub API calls and avoid the unauthenticated 60 req/hr-per-IP limit.
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Compute fork version stamp
+        id: meta
+        shell: pwsh
+        run: |
+          # The source keeps an upstream-aligned semver (e.g. "5.0.1") so it never
+          # collides with the upstream project's own version stamping. The fork
+          # build derives a unique, branch-independent stamp from that base:
+          #   <semver>_pflugs30_<shortsha>_r<run_number>
+          # run_number is globally monotonic across branches, so the stamp is
+          # unique per run and rebuildable for the same commit.
+          $raw = Get-Content "Version Control.accda.src/dbs-properties.json" -Raw
+          $m = [regex]::Match($raw, '"AppVersion":\s*\{\s*"Value":\s*"([^"]+)"')
+          if (-not $m.Success) {
+            Write-Error "Could not read AppVersion from dbs-properties.json"
+            exit 1
+          }
+          $sourceVersion = $m.Groups[1].Value
+          $semver = ([regex]::Match($sourceVersion, '^\d+\.\d+\.\d+')).Value
+          if ([string]::IsNullOrEmpty($semver)) { $semver = "0.0.0" }
+
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $run = "${{ github.run_number }}"
+          $stamp = "${semver}_pflugs30_${shortSha}_r${run}"
+          $tag = "v$stamp"
+
+          Write-Host "Source version: $sourceVersion"
+          Write-Host "Fork stamp:     $stamp"
+          Write-Host "Tag:            $tag"
+
+          "sourceVersion=$sourceVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "semver=$semver"               | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "stamp=$stamp"                 | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag"                     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Fail if release already exists
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          gh release view $tag --repo "${{ github.repository }}" 2>&1 | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "Release $tag already exists. Push a new commit (or bump AppVersion) before re-running."
+            exit 1
+          }
+          Write-Host "Tag $tag is new. Proceeding with build."
+
+      - name: Setup VBA runtime
+        uses: DecimalTurn/setup-vba@abad6bed4025d3d709cbd9c9281f856d298bd68d # v0.1.2
+        with:
+          office-apps: "Access"
+          install-office: "true"
+
+      - name: Stamp fork version into source (build-time only, not committed)
+        shell: pwsh
+        run: |
+          # Rewrites the version fields in the ephemeral checkout so the built
+          # artifact self-identifies as a fork build. These edits are never
+          # committed - the repository source stays upstream-aligned.
+          $stamp = "${{ steps.meta.outputs.stamp }}"
+          $branch = "${{ github.ref_name }}"
+          $date = (Get-Date).ToString('yyyy-MM-dd')
+          $desc = "pflugs30 fork build $stamp (branch $branch, built $date)"
+
+          # UTF-8 BOM matches the VCS source-file encoding requirement.
+          $enc = New-Object System.Text.UTF8Encoding($true)
+
+          $dbsPath = "Version Control.accda.src/dbs-properties.json"
+          $dbs = [System.IO.File]::ReadAllText($dbsPath)
+          $dbs = [regex]::Replace($dbs, '("AppVersion":\s*\{\s*"Value":\s*")[^"]*(")', "`${1}$stamp`${2}")
+          [System.IO.File]::WriteAllText($dbsPath, $dbs, $enc)
+
+          $vbePath = "Version Control.accda.src/vbe-project.json"
+          $vbe = [System.IO.File]::ReadAllText($vbePath)
+          $vbe = [regex]::Replace($vbe, '("Name":\s*"MSAccessVCS",\s*"Description":\s*")[^"]*(")', "`${1}$desc`${2}")
+          [System.IO.File]::WriteAllText($vbePath, $vbe, $enc)
+
+          Write-Host "Stamped AppVersion : $stamp"
+          Write-Host "Stamped VBE desc   : $desc"
+
+      - name: Install bootstrap add-in
+        shell: pwsh
+        run: |
+          & "./.github/scripts/Install-BootstrapAddin.ps1" `
+            -VcsUrl "${{ inputs.bootstrap-url }}" `
+            -TrustSourceDir "$PWD"
+
+      - name: Build add-in from source
+        id: build
+        shell: pwsh
+        run: |
+          $src = Join-Path $PWD "Version Control.accda.src"
+          $out = Join-Path $env:RUNNER_TEMP "addin-build"
+          & "./.github/scripts/Build-AddinFromSource.ps1" -SourceDir $src -OutputDir $out
+
+      - name: Package add-in
+        id: package
+        shell: pwsh
+        run: |
+          $built = "${{ steps.build.outputs.builtPath }}"
+          if ([string]::IsNullOrWhiteSpace($built) -or -not (Test-Path $built)) {
+            Write-Error "Built add-in not found: '$built'"
+            exit 1
+          }
+
+          # Normalize to the standard public asset name regardless of the built
+          # file's extension.
+          $stageDir = Join-Path $env:RUNNER_TEMP "addin-package"
+          if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          $addinDest = Join-Path $stageDir "Version Control.accda"
+          Copy-Item $built $addinDest -Force
+
+          $zipPath = Join-Path $PWD "Version Control.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path $addinDest -DestinationPath $zipPath -Force
+
+          $sha = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+          Write-Host "Package: $zipPath"
+          Write-Host "SHA256:  $sha"
+
+          "zipPath=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha256=$sha"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create fork release
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $apiUrl = "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag"
+          $notes = @"
+          Automated add-in build from ``${{ github.ref_name }}`` @ ``${{ github.sha }}``.
+
+          - Fork version stamp: ``${{ steps.meta.outputs.stamp }}``
+          - Source base version: ``${{ steps.meta.outputs.sourceVersion }}`` (unchanged in source)
+          - Asset SHA256: ``${{ steps.package.outputs.sha256 }}``
+
+          To consume this build in the app pipeline, set VBA-Build's ``vcs-url`` input to:
+
+          ``$apiUrl``
+
+          Switch back to the public add-in by removing that input. The consuming
+          action reads the asset digest automatically, so ``expected-sha256`` is
+          optional.
+          "@
+
+          $args = @(
+            $tag,
+            "${{ steps.package.outputs.zipPath }}",
+            "--repo", "${{ github.repository }}",
+            "--target", "${{ github.sha }}",
+            "--title", $tag,
+            "--notes", $notes
+          )
+          if ("${{ inputs.prerelease }}" -eq "true") { $args += "--prerelease" }
+
+          gh release create @args
+          Write-Host "Released: $apiUrl"
