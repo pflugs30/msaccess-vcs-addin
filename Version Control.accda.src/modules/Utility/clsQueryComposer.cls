@@ -811,6 +811,169 @@ Private Function ParameterTypeSql(ByVal lngFlag As Long) As String
 End Function
 
 
+Private Function ParameterFlagFromType(ByVal strType As String) As Long
+    ' Inverse of ParameterTypeSql: map a PARAMETERS type keyword to its DAO
+    ' data-type flag for the Design View Begin Parameters block. Strips any
+    ' size specifier "( n )" and matches case-insensitively. Covers every
+    ' keyword ParameterTypeSql emits (so our own source round-trips exactly)
+    ' plus common Access/JET aliases. Unknown types default to Value (0).
+    Dim strKey As String
+    Dim lngParen As Long
+
+    strType = Trim$(strType)
+    lngParen = InStr(1, strType, "(")
+    If lngParen > 0 Then strType = Trim$(Left$(strType, lngParen - 1))
+    strKey = LCase$(Replace$(strType, " ", vbNullString))
+
+    Select Case strKey
+        Case vbNullString, "value":                      ParameterFlagFromType = 0
+        Case "boolean", "bit", "yesno":                  ParameterFlagFromType = 1
+        Case "byte":                                     ParameterFlagFromType = 2
+        Case "short", "smallint":                        ParameterFlagFromType = 3
+        Case "long", "longinteger", "integer", "int", "counter": ParameterFlagFromType = 4
+        Case "currency", "money":                        ParameterFlagFromType = 5
+        Case "single", "ieeesingle", "real":            ParameterFlagFromType = 6
+        Case "double", "ieeedouble", "float":           ParameterFlagFromType = 7
+        Case "datetime", "date", "time":                ParameterFlagFromType = 8
+        Case "binary":                                   ParameterFlagFromType = 9
+        Case "text", "char", "varchar", "shorttext":    ParameterFlagFromType = 10
+        Case "oleobject", "longbinary", "image":        ParameterFlagFromType = 11
+        Case "memo", "longtext":                         ParameterFlagFromType = 12
+        Case "guid", "replicationid":                    ParameterFlagFromType = 15
+        Case "bigint":                                   ParameterFlagFromType = 16
+        Case "decimal", "numeric":                       ParameterFlagFromType = 20
+        Case Else
+            ParameterFlagFromType = 0
+            AddBuilderWarning "Unrecognized parameter type '" & strType & _
+                "'; defaulting to Value (flag 0). " & SqlSnippet(), _
+                ModuleName(Me) & ".ParameterFlagFromType"
+    End Select
+End Function
+
+
+Private Sub SplitParameterToken(ByVal strToken As String, _
+    ByRef strName As String, ByRef strType As String)
+    ' Split one parameter declaration ("[Enter ID] Long" or "SKU Text ( 255 )")
+    ' into its name (verbatim -- brackets preserved as authored) and type text.
+    Dim lngClose As Long
+    Dim lngSpace As Long
+
+    strName = vbNullString
+    strType = vbNullString
+    strToken = Trim$(strToken)
+    If Len(strToken) = 0 Then Exit Sub
+
+    If Left$(strToken, 1) = "[" Then
+        lngClose = InStr(1, strToken, "]")
+        If lngClose > 0 Then
+            strName = Left$(strToken, lngClose)
+            strType = Trim$(Mid$(strToken, lngClose + 1))
+        Else
+            strName = strToken
+        End If
+    Else
+        lngSpace = InStr(1, strToken, " ")
+        If lngSpace > 0 Then
+            strName = Left$(strToken, lngSpace - 1)
+            strType = Trim$(Mid$(strToken, lngSpace + 1))
+        Else
+            strName = strToken
+        End If
+    End If
+End Sub
+
+
+Private Function SplitParameterClause(ByVal strClause As String) As Collection
+    ' Split a PARAMETERS clause on top-level commas, honoring [ ] bracketed
+    ' names (which may legally contain commas) and ( ) size specifiers.
+    Dim colParts As New Collection
+    Dim lngI As Long
+    Dim strChar As String
+    Dim lngBracket As Long
+    Dim lngParen As Long
+    Dim cPart As clsConcat
+
+    Set cPart = New clsConcat
+    For lngI = 1 To Len(strClause)
+        strChar = Mid$(strClause, lngI, 1)
+        If strChar = "[" Then
+            lngBracket = lngBracket + 1
+            cPart.Add strChar
+        ElseIf strChar = "]" Then
+            If lngBracket > 0 Then lngBracket = lngBracket - 1
+            cPart.Add strChar
+        ElseIf strChar = "(" Then
+            lngParen = lngParen + 1
+            cPart.Add strChar
+        ElseIf strChar = ")" Then
+            If lngParen > 0 Then lngParen = lngParen - 1
+            cPart.Add strChar
+        ElseIf strChar = "," And lngBracket = 0 And lngParen = 0 Then
+            colParts.Add Trim$(cPart.GetStr)
+            Set cPart = New clsConcat
+        Else
+            cPart.Add strChar
+        End If
+    Next lngI
+    If Len(Trim$(cPart.GetStr)) > 0 Then colParts.Add Trim$(cPart.GetStr)
+
+    Set SplitParameterClause = colParts
+End Function
+
+
+Private Function ParseParameterList(ByVal strClause As String) As Collection
+    ' Parse a raw PARAMETERS clause (the text between "PARAMETERS " and ";",
+    ' e.g. "[Enter ID] Long, [Enter Category] Text ( 255 )") into a collection
+    ' of {name, flag} dictionaries for the Begin Parameters block.
+    Dim colParams As New Collection
+    Dim colTokens As Collection
+    Dim varToken As Variant
+    Dim strName As String
+    Dim strType As String
+    Dim dParam As Dictionary
+
+    Set colTokens = SplitParameterClause(strClause)
+    For Each varToken In colTokens
+        SplitParameterToken CStr(varToken), strName, strType
+        If Len(strName) > 0 Then
+            Set dParam = New Dictionary
+            dParam.Add "name", strName
+            dParam.Add "flag", ParameterFlagFromType(strType)
+            colParams.Add dParam
+        End If
+    Next varToken
+
+    Set ParseParameterList = colParams
+End Function
+
+
+Private Sub EmitParameters(cOut As clsConcat)
+    ' Design View "Begin Parameters" block. Access stores declared query
+    ' parameters (MSysQueries Attribute 2) here for designer-built queries.
+    ' EmitDesignViewQdef previously omitted this block, so a parameterized
+    ' query imported via the Design View path lost its PARAMETERS clause.
+    If DebugMode(True) Then On Error GoTo 0 Else On Error Resume Next
+
+    If Len(m_strParameters) = 0 Then GoTo CleanUp
+
+    Dim colParams As Collection
+    Set colParams = ParseParameterList(m_strParameters)
+    If colParams.Count = 0 Then GoTo CleanUp
+
+    cOut.Add "Begin Parameters", vbCrLf
+    Dim dParam As Dictionary
+    For Each dParam In colParams
+        cOut.Add "    Name =""" & CStr(dParam("name")) & """", vbCrLf
+        cOut.Add "    Flag =" & CStr(dParam("flag")), vbCrLf
+    Next dParam
+    cOut.Add "End", vbCrLf
+
+CleanUp:
+    CatchAny eelError, "Error emitting parameters block. " & SqlSnippet(), _
+        ModuleName(Me) & ".EmitParameters"
+End Sub
+
+
 Private Sub BuildFromClause(cSql As clsConcat, colTables As Collection, colJoins As Collection)
 
     If DebugMode(True) Then On Error GoTo 0 Else On Error Resume Next
@@ -2812,6 +2975,15 @@ Private Sub EmitDesignViewQdef(cOut As clsConcat, dProperties As Dictionary, _
         Next dCol
         cOut.Add "End", vbCrLf
     End If
+
+    ' Parameters -- declared query parameters (MSysQueries Attribute 2). Access
+    ' stores these in a Begin Parameters block immediately after the
+    ' OutputColumns block for designer-built queries. LoadFromText rejects the
+    ' block ("Expected: End of file. Found: Parameters.") when it appears after
+    ' the Joins/OrderBy/Groups blocks, so it must be emitted here -- before
+    ' Joins -- not merely before the properties. Omitting it entirely drops the
+    ' PARAMETERS clause when a parameterized query takes the Design View path.
+    EmitParameters cOut
 
     ' Joins — multi-condition ON clauses must be decomposed into separate
     ' rows because Access's Design View .qdef stores each condition as its

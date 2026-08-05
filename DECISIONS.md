@@ -83,6 +83,97 @@ contradictory guidance.
 
 ---
 
+## 2026-08-04 — Design View queries carry parameters in a `Begin Parameters` block, not a leading SQL `PARAMETERS` line
+
+**Trigger**: A parameterized query rebuilt from source lost its `PARAMETERS`
+declaration whenever it took the Design View import path (joyfullservice#744;
+downstream cash4rc/original-system#330, where a dimension-entry query silently
+stopped prompting). `clsQueryComposer.EmitDesignViewQdef` assembled the
+structured `.qdef` that `Application.LoadFromText` consumes but never emitted
+the declared parameters, so the rebuilt query came back with an empty parameter
+collection. The SQL View path was unaffected — there the whole statement,
+`PARAMETERS ...;` included, is handed to Access as one SQL memo — so the loss
+only showed up for designer-built queries whose stored grid layout forces
+`blnDesignView = True`. The existing parameter fixtures were all SQL-View
+shaped, so nothing exercised the gap.
+
+**Options explored**:
+- **Prepend a SQL `PARAMETERS ...;` line to the structured `.qdef`** — the
+  obvious guess, mirroring the SQL memo grammar. Rejected empirically: Access
+  rejects it. `LoadFromText` on a structured qdef with a leading `PARAMETERS`
+  line fails with `Expected: 'Operation'. Found: PARAMETERS.` (and in some
+  automation contexts blocks on a modal parse error). The structured format has
+  no grammar for an inline parameters declaration.
+- **Force every parameterized query onto the SQL View path** — would sidestep
+  the emitter gap entirely by never taking Design View for a query that
+  declares parameters. Rejected: it throws away the designer layout and grid
+  metadata that Design View exists to preserve, regressing the very queries
+  this add-in tries hardest to round-trip faithfully.
+- **Emit the native `Begin Parameters` block** (chosen) — capturing a
+  designer-built parameterized query with `Application.SaveAsText` shows Access
+  stores parameters in a dedicated `Begin Parameters ... End` block of
+  repeated `Name ="<bracketed>"` / `Flag =<DAO type>` pairs, positioned after
+  `Begin OutputColumns ... End` and before the `dbBoolean` properties. This is
+  the format Access itself round-trips, so it is the one to emit.
+
+**Decision**: `EmitDesignViewQdef` now calls `EmitParameters`, which parses the
+raw clause held in `m_strParameters` (e.g. `[Enter ID] Long, [Enter Category]
+Text ( 255 )`) into name/flag pairs and emits the `Begin Parameters` block in
+the native position. Parameter names are emitted verbatim (brackets preserved
+as authored); the flag comes from `ParameterFlagFromType`, the inverse of the
+existing `ParameterTypeSql` map, covering every keyword that map emits plus
+common JET aliases and defaulting an unknown type to Value (0) with a builder
+warning. A bracket/paren-aware top-level comma split (`SplitParameterClause`)
+keeps commas inside `[ ]` names and `( )` size specifiers from breaking the
+list apart.
+
+**No export-format-version gate and no `GetExporterRevisions` bump.** Both
+mechanisms govern *export* output; the `.qdef` is an import-only intermediate.
+`clsDbQuery` exports `.sql` + `.json` only (and deletes any legacy `.qdef`),
+generating the `.qdef` on the fly to a temp file at import time. This change
+therefore alters build/import behavior exclusively, and import must stay
+backward compatible with every prior export — which it does, since older
+sources that never carried parameters simply produce no block.
+
+**What this rules out**: The earlier working hypothesis — that native Access
+always serializes a parameterized query as a SQL memo and the structured
+format has no place for parameters — is now disproven and should not be
+revisited; the `Begin Parameters` block is the canonical Design View
+representation. Emitting parameters as a leading SQL line is a dead end
+(Access rejects it). The block's position is pinned relative to
+`OutputColumns` and the property list; a future change that reorders the
+structured blocks must keep parameters ahead of the properties. Type coverage
+beyond the fixture's `Long`/`Text` rests on the `ParameterFlagFromType` map
+rather than on round-trip fixtures for every DAO type.
+
+**Follow-up (2026-08-04) — the block must precede `Begin Joins`, not merely
+the property list.** The initial fix emitted `EmitParameters` just before the
+property block. That is correct only for queries with no `Begin Joins` /
+`Begin OrderBy` / `Begin Groups` — there the block still lands immediately
+after `OutputColumns`. A parameterized query that *also* had a join or
+`ORDER BY` pushed the block past those structure blocks, and Access rejected
+the qdef with `Expected: End of file. Found: Parameters.`, failing the Design
+View import and silently falling back to SQL View (losing layout on four
+production queries). `EmitParameters` now runs immediately after the
+`Begin OutputColumns ... End` block and *before* `Begin Joins`, matching the
+native `SaveAsText` position exactly. The constraint is therefore stronger
+than "ahead of the properties": parameters must precede the
+Joins/OrderBy/Groups blocks as well.
+
+**Relevant files**:
+- `Version Control.accda.src/modules/Utility/clsQueryComposer.cls` —
+  `EmitParameters` and its helpers (`ParseParameterList`,
+  `SplitParameterClause`, `SplitParameterToken`, `ParameterFlagFromType`);
+  `EmitDesignViewQdef` calls `EmitParameters` immediately after the
+  `OutputColumns` block and before `Begin Joins`
+- `Testing/Fixtures/queries/regression/qryRegressionDesignViewParameters.*`,
+  `qryRegressionDesignViewParameterTypes.*` — single-table parameter
+  round-trip fixtures
+- `Testing/Fixtures/queries/regression/qryRegressionDesignViewParametersJoinOrderBy.*`
+  — pins the block position for a query with an INNER JOIN and ORDER BY
+
+---
+
 ## 2026-08-02 — Rubberduck `@TestModule` support as a parallel discovery path, with a tri-state `Inconclusive` outcome
 
 **Trigger**: Access projects commonly maintain a [Rubberduck](https://github.com/rubberduck-vba/Rubberduck) unit-test suite (`@TestModule` / `@TestMethod`). Those tests were invisible to the VCS runner — they could not be driven headlessly, through the web runner, or via MCP, nor reported alongside `TestAssert`-based tests. The goal was to make an existing Rubberduck suite *also* runnable through the VCS runner without rewriting test bodies, forking Rubberduck, or making Rubberduck a required dependency.
@@ -100,6 +191,9 @@ Model `Inconclusive` end to end: `etsInconclusive` in `eTestStatus`, an `eAssert
 A generated dispatcher (`modVCSTestDispatch`, temporary) sidesteps an Access `Application.Run` limitation: it cannot resolve a proc name duplicated across standard modules, and every RD module shares lifecycle proc names. The dispatcher injects uniquely-named wrappers that call each proc module-qualified, and is removed on cleanup.
 
 **What this rules out**: the native VCS test convention does not gain `@Test`-style annotations (that path is unchanged). The runner will not depend on the Rubberduck engine, and will not host RD's `AssertHandler` — outcome computation for the VCS path stays in the project-side shim. Full source references and the emulation model are in [`docs/rubberduck-test-runner.md`](docs/rubberduck-test-runner.md); user-facing usage is in `Wiki/Testing.md`.
+---
+
+## 2026-07-31 — One declarative list of export formats, guarded by a test that parses the enum
 
 **Trigger**: Adding an export format version took three coordinated edits, and one of them failed silently. `frmVCSOptionsExport.Form_Load` populated its combo by looping `For lngFormat = EFV_4_1_2 To eExportFormatVersion.[_Last]` — 10,000 iterations across the sparse packed-integer space — and filtering through a hand-written `Case EFV_4_1_2, EFV_5_0_0, EFV_5_1_0`. Forget that `Case` and the new format still gates correctly everywhere in code; it just never appears in the UI, so no user can select it. `[_Last] = 50100` was a second hand-copied duplicate of the newest value.
 
